@@ -43,7 +43,8 @@ type ReportReduceReply struct {
 }
 
 //flag 0-err 1-begin map
-//2-map end ,need to break loop
+//2-no not have map task temporarily,wait for a while
+//3-all map tasks end,begin to reduce
 type MapReply struct {
 	Filename   string
 	Tasknumber int
@@ -52,7 +53,8 @@ type MapReply struct {
 }
 
 //flag 0-err 1-begin reduce
-//2-wait for other map tasks end,sleep for a while,3-all reduce tasks end
+//2-no not have reduce task temporarily,wait for a while
+//3-all reduce tasks end
 type ReduceReply struct {
 	Files      []string
 	Tasknumber int

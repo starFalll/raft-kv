@@ -67,7 +67,6 @@ func DealMap(mapf func(string, string) []KeyValue,
 	interfiles := make(map[int][]string)
 	for k, v := range hashmaps {
 		filename := ("mr-" + strconv.Itoa(mapstruct.Tasknumber) + "-" + strconv.Itoa(k+1))
-		log.Printf("new filename:%v\n", filename)
 		os.Remove(filename)
 		file, er := os.Create(filename)
 		if er != nil {
@@ -149,8 +148,8 @@ func Worker(mapf func(string, string) []KeyValue,
 		mapargs.Maptask = true
 		mapreply := MapReply{}
 		//request map task
-		res := call("Master.AssignMap", &mapargs, &mapreply)
-		log.Printf("Worker(mapf func(string, string) res:%v\n", res)
+		call("Master.AssignMap", &mapargs, &mapreply)
+		//log.Printf("Worker(mapf func(string, string) res:%v flag:%v\n", res, mapreply.Flag)
 		if mapreply.Flag == 1 {
 			//store all intermediate files
 			interfiles := DealMap(mapf, mapreply)
@@ -159,12 +158,15 @@ func Worker(mapf func(string, string) []KeyValue,
 			endmapreply := EndMapReply{}
 
 			//upload intermediate files name
-			call("Master.CommitMediateFiles", &endmapargs, &endmapreply)
+			res := call("Master.CommitMediateFiles", &endmapargs, &endmapreply)
+			log.Printf("Master.CommitMediateFiles res:%v \n", res)
 			if endmapreply.Err != nil {
 				log.Fatalf("Commit intermediate files failue, tasknum:%v", mapreply.Tasknumber)
 			}
 		} else if mapreply.Flag == 2 {
-			log.Printf("Map stage end, begin reduce...\n")
+			time.Sleep(10 * time.Millisecond)
+		} else if mapreply.Flag == 3 {
+			log.Printf("all map tasks end,begin to reduce:%v\n", mapreply.Flag)
 			break
 		} else {
 			log.Printf("Request for map task failue:%v\n", mapreply.Flag)
@@ -183,11 +185,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		reduceargs := MapTaskArgs{false}
 		reducereply := ReduceReply{}
 		//request reduce task
-		res := call("Master.AssignReduce", &reduceargs, &reducereply)
-		log.Printf("Call Master.AssignReduce res:%v, flag:%v\n", res, reducereply.Flag)
-		if reducereply.Flag == 2 {
-			time.Sleep(2 * time.Second)
-		} else if reducereply.Flag == 1 {
+		call("Master.AssignReduce", &reduceargs, &reducereply)
+		//log.Printf("Call Master.AssignReduce res:%v, flag:%v\n", res, reducereply.Flag)
+		if reducereply.Flag == 1 {
 
 			filename := DealReduce(reducef, reducereply)
 			reportreduceargs := ReportReduceArgs{reducereply.Tasknumber, filename}
@@ -198,6 +198,8 @@ func Worker(mapf func(string, string) []KeyValue,
 				log.Fatalf("Commit final files failue, tasknum:%v", reducereply.Tasknumber)
 			}
 
+		} else if reducereply.Flag == 2 {
+			time.Sleep(10 * time.Millisecond)
 		} else if reducereply.Flag == 3 {
 			log.Printf("All reduce tasks end\n")
 			break
@@ -242,8 +244,8 @@ func CallExample() {
 // returns false if something goes wrong.
 //
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	//c, err := rpc.DialHTTP("unix", "mr-socket")
+	//c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	c, err := rpc.DialHTTP("unix", "mr-socket")
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}

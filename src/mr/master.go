@@ -5,23 +5,33 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
 
 type Master struct {
 	// Your definitions here.
-	mu         sync.Mutex
-	indexinput int
+	mu sync.Mutex
+
 	nReduce    int
-	endmap     bool
+	leftmap    int
+	leftreduce int
+
 	//record unused begin files
-	inputfileset map[int]bool
+	inputfileset  []bool
+	receivemapset []bool
 
 	//recored unused mediatefiles
 	hashset   map[int]bool
 	hashsetbk map[int]bool
 
+	//deal crash
+	//Tasknumber: unix time
+	mapcrash    map[int]int64
+	reducecrash map[int]int64
+
+	//indexinput   []int
 	inputfiles   []string
 	mediatefiles map[int][]string
 	finalfiles   []string
@@ -44,15 +54,30 @@ func (m *Master) AssignMap(args *MapTaskArgs, reply *MapReply) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.indexinput >= len(m.inputfiles) {
-		reply.Flag = 2
+
+	//3-all map tasks end,begin to reduce
+	if m.leftmap <= 0 {
+		reply.Flag = 3
 		return nil
 	}
-	reply.Filename = m.inputfiles[m.indexinput]
-	reply.Tasknumber = m.indexinput
-	reply.NReduce = m.nReduce
-	reply.Flag = 1
-	m.indexinput++
+
+	for k, v := range m.inputfileset {
+
+		//1-new map tasks
+		if v == false {
+			reply.Filename = m.inputfiles[k]
+			reply.Tasknumber = k
+			reply.NReduce = m.nReduce
+			reply.Flag = 1
+			m.inputfileset[k] = true
+			m.mapcrash[k] = time.Now().Unix()
+			return nil
+		}
+
+	}
+
+	//2-no not have map task temporarily,wait for a while
+	reply.Flag = 2
 	return nil
 
 }
@@ -60,18 +85,31 @@ func (m *Master) AssignMap(args *MapTaskArgs, reply *MapReply) error {
 func (m *Master) CommitMediateFiles(args *EndMapArgs, reply *EndMapReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for k, v := range args.Files {
-		m.mediatefiles[k] = append(m.mediatefiles[k], v...)
-		m.hashset[k] = true
+
+	//have not received this MediateFile
+	log.Printf("tasknumber:%v,m.receivemapset[args.Tasknumber]:%v\n", args.Tasknumber, m.receivemapset[args.Tasknumber])
+	if m.receivemapset[args.Tasknumber] == false {
+		for k, v := range args.Files {
+			m.mediatefiles[k] = append(m.mediatefiles[k], v...)
+			m.hashset[k] = true
+		}
+		m.receivemapset[args.Tasknumber] = true
 		m.inputfileset[args.Tasknumber] = true
+		m.leftmap--
+		//all map tasks end
+		log.Printf("CommitMediateFiles map num:%v\n", args.Tasknumber)
+		if m.leftmap <= 0 {
+			for k, v := range m.hashset {
+				m.hashsetbk[k] = v
+			}
+
+			m.leftreduce = len(m.hashsetbk)
+			log.Printf("CommitMediateFiles end:%v\n", args.Tasknumber)
+		}
+		return nil
+
 	}
-	//all map tasks end
-	log.Printf("CommitMediateFiles map num:%v\n", args.Tasknumber)
-	if len(m.inputfileset) == len(m.inputfiles) {
-		m.endmap = true
-		m.hashsetbk = m.hashset
-		log.Printf("CommitMediateFiles end:%v\n", args.Tasknumber)
-	}
+	log.Printf("task num:%v have already received.", args.Tasknumber)
 	return nil
 }
 
@@ -82,32 +120,28 @@ func (m *Master) AssignReduce(args *MapTaskArgs, reply *ReduceReply) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.endmap == false {
-		reply.Flag = 2
+
+	//3-all reduce tasks end
+	if m.leftreduce <= 0 {
+		reply.Flag = 3
 		return nil
 	}
 
 	for k, v := range m.hashset {
+
+		//1-begin reduce
 		if v == true {
 			reply.Tasknumber = k
 			reply.Files = m.mediatefiles[reply.Tasknumber]
 			reply.Flag = 1
 			m.hashset[k] = false
+			m.reducecrash[k] = time.Now().Unix()
 			return nil
 		}
 	}
 
-	/**
-	if len(m.notusearr) > 0 {
-		reply.Tasknumber = m.notusearr[0]
-		reply.Files = m.mediatefiles[reply.Tasknumber]
-		reply.Flag = 1
-		m.notusearr = m.notusearr[1:]
-		return nil
-	}
-	**/
-	//no reduce tasks
-	reply.Flag = 3
+	//2-no not have reduce task temporarily,wait for a while
+	reply.Flag = 2
 	return nil
 
 }
@@ -115,9 +149,53 @@ func (m *Master) AssignReduce(args *MapTaskArgs, reply *ReduceReply) error {
 func (m *Master) CommitFinalFiles(args *ReportReduceArgs, reply *ReportReduceReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.finalfiles = append(m.finalfiles, args.Filename)
-	m.hashsetbk[args.Tasknumber] = false
+
+	//to prevent re-commit
+	if m.hashsetbk[args.Tasknumber] == true {
+		m.finalfiles = append(m.finalfiles, args.Filename)
+		m.hashsetbk[args.Tasknumber] = false
+		m.hashset[args.Tasknumber] = false
+		m.leftreduce--
+	}
+
 	return nil
+}
+
+func (m *Master) EndDealCrash() bool {
+	ret := false
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.leftmap > 0 {
+		//in map stage
+		nowunixtime := time.Now().Unix()
+		for k, v := range m.mapcrash {
+			if nowunixtime-v > 5 && m.receivemapset[k] == false {
+				log.Printf("EndDealCrash() map crash tasknumber:%v,NowUnixTime:%v, LastTime:%v\n",
+					k, nowunixtime, v)
+				m.inputfileset[k] = false
+			}
+		}
+	} else if m.leftreduce > 0 {
+		//in reduce stage
+		nowunixtime := time.Now().Unix()
+		for k, v := range m.reducecrash {
+			if nowunixtime-v > 5 && m.hashsetbk[k] == true {
+				log.Printf("EndDealCrash() reduce crash tasknumber:%v,NowUnixTime:%v, LastTime:%v\n",
+					k, nowunixtime, v)
+				m.hashset[k] = true
+			}
+		}
+	} else {
+		ret = true
+	}
+	return ret
+}
+
+func (m *Master) ScheduleDlCrash() {
+	time.Sleep(5 * time.Second)
+	for m.EndDealCrash() == false {
+		time.Sleep(5 * time.Second)
+	}
 }
 
 //
@@ -126,14 +204,13 @@ func (m *Master) CommitFinalFiles(args *ReportReduceArgs, reply *ReportReduceRep
 func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
-	l, e := net.Listen("tcp", ":1234")
-	//os.Remove("mr-socket")
-	//l, e := net.Listen("unix", "mr-socket")
+	//l, e := net.Listen("tcp", ":1234")
+	os.Remove("mr-socket")
+	l, e := net.Listen("unix", "mr-socket")
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
-	time.Sleep(5 * time.Second)
 }
 
 //
@@ -144,13 +221,15 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
-	for _, v := range m.hashsetbk {
-		if v == true {
-			return ret
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.hashsetbk) > 0 {
+		if m.leftreduce <= 0 {
+			log.Printf("(m *Master) Done() end")
+			ret = true
 		}
 	}
-	log.Printf("(m *Master) Done() end")
-	ret = true
+
 	return ret
 }
 
@@ -163,12 +242,25 @@ func MakeMaster(files []string, nReduce int) *Master {
 	// Your code here.
 
 	m.inputfiles = files
-	m.indexinput = 0
+	//m.indexinput = make([]int, len(files))
+
 	m.nReduce = nReduce
 	m.hashset = make(map[int]bool)
+	m.hashsetbk = make(map[int]bool)
 	m.mediatefiles = make(map[int][]string)
-	m.inputfileset = make(map[int]bool)
+
+	m.leftmap = len(files)
+
+	m.inputfileset = make([]bool, len(files))
+	m.receivemapset = make([]bool, len(files))
+
+	m.mapcrash = make(map[int]int64)
+	m.reducecrash = make(map[int]int64)
+
 	m.server()
+	go m.ScheduleDlCrash()
+
+	log.Printf("Init master success!")
 
 	return &m
 }
