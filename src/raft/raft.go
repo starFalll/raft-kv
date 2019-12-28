@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -192,6 +191,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Ret = false
 		return
 	} else if rf.votedFor == -1 && rf.state == "follower" {
+
+		//**Note that you cannot vote repeatedly**
 
 		lastLogIndex := len(rf.logs) - 1
 		lastLogTerm := rf.logs[lastLogIndex].Term
@@ -394,7 +395,7 @@ func (rf *Raft) PrintRaftInfo() {
 }
 
 func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
-	//random from 20 to 40,election timer from 2000ms to 4000ms
+	//random from 200 to 400,election timer from 2000ms to 4000ms
 	//**heartbeat for 100ms,so election timer must far more than 100ms**
 	for {
 		electionTimer := rand.Int()%200 + 200
@@ -420,6 +421,8 @@ func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
 			if rf.state == "follower" {
 				DPrintf("DealRequestVote() timeout raft term:%v, serverid:%v, state:%q, ConvertToCandidate\n",
 					rf.currentTerm, me, rf.state)
+
+				//only from follower convert to candidate, increment currentTerm
 				addTerm = true
 			} else {
 				DPrintf("Candidate:%v election timeout, start new election\n", rf.me)
@@ -461,13 +464,16 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 		if index != me {
 			go func(args *RequestVoteArgs, peer *labrpc.ClientEnd, index int) {
 				reply := RequestVoteReply{}
-				begintime := time.Now().Unix()
-				flag := rand.Int31n(100000)
-				DPrintf("begin:%v Candidate Call RequestVote %v to %v. rand:%v\n", begintime, me, index, flag)
+				//begintime := time.Now().Unix()
+				//flag := rand.Int31n(100000)
+				//DPrintf("begin:%v Candidate Call RequestVote %v to %v. rand:%v\n", begintime, me, index, flag)
+
+				//maybe block, if rpc network wrong
 				peer.Call("Raft.RequestVote", args, &reply)
-				endtime := time.Now().Unix()
-				diff := endtime - begintime
-				DPrintf("end:%v diff:%v Candidate Call RequestVote %v to %v rand:%v\n", endtime, diff, me, index, flag)
+
+				//endtime := time.Now().Unix()
+				//diff := endtime - begintime
+				//DPrintf("end:%v diff:%v Candidate Call RequestVote %v to %v rand:%v\n", endtime, diff, me, index, flag)
 
 				rf.mu.Lock()
 				if args.Term == rf.currentTerm && rf.state == "candidate" &&
@@ -500,7 +506,7 @@ func (rf *Raft) BecomeLeader(peers []*labrpc.ClientEnd, serverNum int) {
 	for i := 0; i < serverNum; i++ {
 		rf.leaderState.NextIndex[i] = lastIndex
 	}
-	fmt.Printf("BecomeLeader() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
+	DPrintf("BecomeLeader() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
 	//send initial empty AppendEntries RPCs
 	//(heartbeat) to each server
 	go rf.SendHeartBeat(peers)
@@ -558,24 +564,27 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 
 				rf.mu.Unlock()
 
+				//begintime := time.Now().Unix()
+				//flag := rand.Int31n(200000)
+				//DPrintf("begin:%v SendAppendEntriesRPC() call %v to %v. rand:%v\n", begintime, me, serverId, flag)
+
 				//next tow line codes not lock , because if call delay too long
-				//the full rf mutex would be blocked
-				begintime := time.Now().Unix()
-				flag := rand.Int31n(200000)
-				DPrintf("begin:%v SendAppendEntriesRPC() call %v to %v. rand:%v\n", begintime, me, serverId, flag)
+				//the full rf mutex would be blocked, cause not to receive RequestVote rpc
 				reply := AppendEntriesReply{-1, false}
 				peer.Call("Raft.AppendEntries", &args, &reply)
-				endtime := time.Now().Unix()
-				diff := endtime - begintime
-				DPrintf("end:%v diff:%v SendAppendEntriesRPC() call AppendEntries %v to %v. rand:%v\n", endtime, diff, me, serverId, flag)
 
-				rf.mu.Lock()
-				DPrintf("call AppendEntries raft term:%v leaderid:%v serverid:%v rf.state:%q\n", args.Term, me, serverId, rf.state)
-				DPrintf("PrevLogIndex:%v, PrevLogTerm:%v replysuccess:%v\n", args.PrevLogIndex, args.PrevLogTerm, reply.Success)
-				rf.mu.Unlock()
+				//endtime := time.Now().Unix()
+				//diff := endtime - begintime
+				//DPrintf("end:%v diff:%v SendAppendEntriesRPC() call AppendEntries %v to %v. rand:%v\n", endtime, diff, me, serverId, flag)
+
+				//rf.mu.Lock()
+				//DPrintf("call AppendEntries raft term:%v leaderid:%v serverid:%v rf.state:%q\n", args.Term, me, serverId, rf.state)
+				//DPrintf("PrevLogIndex:%v, PrevLogTerm:%v replysuccess:%v\n", args.PrevLogIndex, args.PrevLogTerm, reply.Success)
+				//rf.mu.Unlock()
 
 				retryNum := 0
 				for reply.Success == false {
+
 					//when reply term > currentTerm
 					rf.mu.Lock()
 					if reply.Term > rf.currentTerm {
@@ -583,9 +592,12 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 						rf.mu.Unlock()
 						break
 					} else {
-						//nextindex--
+
 						if reply.Term > -1 && rf.leaderState.NextIndex[serverId] > 1 {
+
+							//nextindex--
 							rf.leaderState.NextIndex[serverId]--
+
 							args.PrevLogIndex = rf.leaderState.NextIndex[serverId] - 1
 							DPrintf("PrevLogIndex:%v reply.Term:%v success:%v\n",
 								args.PrevLogIndex, reply.Term, reply.Success)
@@ -598,8 +610,9 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 							break
 						}
 						reply = AppendEntriesReply{-1, false}
+
+						//maybe blocked too
 						peer.Call("Raft.AppendEntries", &args, &reply)
-						//DPrintf("for loop Call AppendEntriesRPC raft leaderid:%v, serverId:%v\n", me, serverId)
 
 					}
 				}
