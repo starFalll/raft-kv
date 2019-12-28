@@ -191,9 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		reply.Ret = false
 		return
-	} else if rf.votedFor == -1 && rf.state == "follower" ||
-		rf.votedFor == args.CandidateID && rf.currentTerm == args.Term &&
-			rf.state == "follower" {
+	} else if rf.votedFor == -1 && rf.state == "follower" {
 
 		lastLogIndex := len(rf.logs) - 1
 		lastLogTerm := rf.logs[lastLogIndex].Term
@@ -204,7 +202,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			rf.votedFor = args.CandidateID
 			reply.Ret = true
-			go rf.ConvertToCandidate(args.peers, rf.me, rf.votedFor, false, true)
+			go rf.ConvertToCandidate(args.peers, rf.me, rf.votedFor, false)
 			DPrintf("RequestVote() term:%v serverid:%v, vote for :%v\n", reply.Term, rf.me, args.CandidateID)
 			return
 		}
@@ -378,17 +376,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("Make() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, me, rf.state)
 
 	go rf.DealRequestVote(peers, me)
-
+	go rf.PrintRaftInfo()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
 
-func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
-	//random from 20 to 40,election timer from 200ms to 400ms
+func (rf *Raft) PrintRaftInfo() {
 	for {
-		electionTimer := rand.Int()%20 + 20
+		rf.mu.Lock()
+		DPrintf("ServerID:%v, state:%q, term:%v, votefor:%v, votenum:%v\n",
+			rf.me, rf.state, rf.currentTerm, rf.votedFor, rf.voteNum)
+		rf.mu.Unlock()
+		time.Sleep(1000 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
+	//random from 20 to 40,election timer from 2000ms to 4000ms
+	//**heartbeat for 100ms,so election timer must far more than 100ms**
+	for {
+		electionTimer := rand.Int()%200 + 200
 		i := 0
 		for ; i < electionTimer; i++ {
 			time.Sleep(10 * time.Millisecond)
@@ -409,12 +418,13 @@ func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
 		if i >= electionTimer && rf.state != "leader" {
 			addTerm := false
 			if rf.state == "follower" {
-				DPrintf("DealRequestVote() timeout raft serverid:%v, state:%q\n, ConvertToCandidate", me, rf.state)
+				DPrintf("DealRequestVote() timeout raft term:%v, serverid:%v, state:%q, ConvertToCandidate\n",
+					rf.currentTerm, me, rf.state)
 				addTerm = true
 			} else {
 				DPrintf("Candidate:%v election timeout, start new election\n", rf.me)
 			}
-			go rf.ConvertToCandidate(peers, me, me, addTerm, false)
+			go rf.ConvertToCandidate(peers, me, me, addTerm)
 
 		}
 		rf.mu.Unlock()
@@ -423,7 +433,7 @@ func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
 
 }
 
-func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor int, addTerm bool, restartTimer bool) {
+func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor int, addTerm bool) {
 
 	rf.mu.Lock()
 	rf.state = "candidate"
@@ -436,10 +446,8 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 		rf.voteNum = 1
 	}
 
-	if restartTimer == true {
-		//restart a timer
-		rf.restartTimer = true
-	}
+	//restart a timer
+	rf.restartTimer = true
 
 	lastLogIndex := len(rf.logs) - 1
 	lastLogTerm := rf.logs[lastLogIndex].Term
@@ -451,9 +459,16 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 
 	for index, peer := range peers {
 		if index != me {
-			go func(args *RequestVoteArgs, peer *labrpc.ClientEnd) {
+			go func(args *RequestVoteArgs, peer *labrpc.ClientEnd, index int) {
 				reply := RequestVoteReply{}
+				begintime := time.Now().Unix()
+				flag := rand.Int31n(100000)
+				DPrintf("begin:%v Candidate Call RequestVote %v to %v. rand:%v\n", begintime, me, index, flag)
 				peer.Call("Raft.RequestVote", args, &reply)
+				endtime := time.Now().Unix()
+				diff := endtime - begintime
+				DPrintf("end:%v diff:%v Candidate Call RequestVote %v to %v rand:%v\n", endtime, diff, me, index, flag)
+
 				rf.mu.Lock()
 				if args.Term == rf.currentTerm && rf.state == "candidate" &&
 					reply.Ret == true && reply.VoteGranted == true {
@@ -466,7 +481,7 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 					rf.BecomeFollower(reply.Term)
 				}
 				rf.mu.Unlock()
-			}(&args, peer)
+			}(&args, peer, index)
 		}
 
 	}
@@ -541,8 +556,20 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 
 				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 
+				rf.mu.Unlock()
+
+				//next tow line codes not lock , because if call delay too long
+				//the full rf mutex would be blocked
+				begintime := time.Now().Unix()
+				flag := rand.Int31n(200000)
+				DPrintf("begin:%v SendAppendEntriesRPC() call %v to %v. rand:%v\n", begintime, me, serverId, flag)
 				reply := AppendEntriesReply{-1, false}
 				peer.Call("Raft.AppendEntries", &args, &reply)
+				endtime := time.Now().Unix()
+				diff := endtime - begintime
+				DPrintf("end:%v diff:%v SendAppendEntriesRPC() call AppendEntries %v to %v. rand:%v\n", endtime, diff, me, serverId, flag)
+
+				rf.mu.Lock()
 				DPrintf("call AppendEntries raft term:%v leaderid:%v serverid:%v rf.state:%q\n", args.Term, me, serverId, rf.state)
 				DPrintf("PrevLogIndex:%v, PrevLogTerm:%v replysuccess:%v\n", args.PrevLogIndex, args.PrevLogTerm, reply.Success)
 				rf.mu.Unlock()
