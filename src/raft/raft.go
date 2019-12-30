@@ -206,7 +206,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIndex := len(rf.logs) - 1
 		lastLogTerm := rf.logs[lastLogIndex].Term
 
-		if args.LastLogTerm >= lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		//
+		//If votedFor is null or candidateId, and candidate’s log is at
+		//least as up-to-date as receiver’s log
+		//Raft determines which of two logs is more up-to-date
+		//by comparing the index and term of the last entries in the
+		//logs. If the logs have last entries with different terms, then
+		//the log with the later term is more up-to-date. If the logs
+		//end with the same term, then whichever log is longer is
+		//more up-to-date
+		//
+		if args.LastLogTerm > lastLogTerm || args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
 			reply.VoteGranted = true
 			rf.currentTerm = args.Term
 			reply.Term = rf.currentTerm
@@ -232,7 +242,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("AppendEntries leaderterm:%v, leaderid:%v, serverterm:%v, serverid:%v, args.PrevLogIndex:%v, args.PrevLogTerm:%v entriesLen:%v LeaderCommit:%v\n",
 		args.Term, args.LeaderID, rf.currentTerm, rf.me, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit)
 	//implementation 1
-	reply.Modify = true
+
 	if args.Term < rf.currentTerm {
 
 		reply.Term = rf.currentTerm
@@ -259,6 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("serverid:%v args.PrevLogIndex:%v, args.PrevLogTerm:%v overflow:%v\n",
 			rf.me, args.PrevLogIndex, args.PrevLogTerm, overFlow)
 		reply.Term = rf.currentTerm
+		reply.Modify = true
 		reply.Success = false
 		return
 	}
@@ -298,6 +309,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("AppendEntries serverID:%v logs:%v\n", rf.me, rf.logs)
 	reply.NextIndex = len(rf.logs)
 	reply.Term = rf.currentTerm
+	reply.Modify = true
 	reply.Success = true
 	return
 }
@@ -363,9 +375,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	} else {
 		term = rf.currentTerm
 		logEntry := make([]LogEntry, 1)
-		logEntry[0] = LogEntry{term, command}
-		rf.logs = append(rf.logs, logEntry...)
+		lastCommond := rf.logs[len(rf.logs)-1].Command
+
+		//if lastCommond == commond re-start, not to append, use last log entry
+		if lastCommond != command {
+			logEntry[0] = LogEntry{term, command}
+			rf.logs = append(rf.logs, logEntry...)
+
+		} else {
+			logEntry[0] = rf.logs[len(rf.logs)-1]
+		}
 		index = len(rf.logs) - 1
+
 		DPrintf("Start() term:%v serverID:%v index:%v\n", term, rf.me, index)
 		DPrintf("Start serverID:%v logs:%v\n", rf.me, rf.logs)
 		go rf.SendAppendEntriesRPC(rf.peers, logEntry, index)
@@ -442,10 +463,10 @@ func (rf *Raft) PrintRaftInfo() {
 }
 
 func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
-	//random from 200 to 400,election timer from 2000ms to 4000ms
+	//random from 100 to 300,election timer from 1000ms to 3000ms
 	//**heartbeat for 100ms,so election timer must far more than 100ms**
 	for {
-		electionTimer := rand.Int()%200 + 200
+		electionTimer := rand.Int()%200 + 100
 		i := 0
 		for ; i < electionTimer; i++ {
 			time.Sleep(10 * time.Millisecond)
@@ -688,26 +709,31 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 
 	rf.mu.Unlock()
 
-	begintime := time.Now().Unix()
-	flag := rand.Int31n(10000)
-	DPrintf("begin:%v SendAppendEntriesRPCToOneServer() call %v to %v. rand:%v\n", begintime, rf.me, serverId, flag)
+	//begintime := time.Now().Unix()
+	//flag := rand.Int31n(10000)
+	//DPrintf("begin:%v SendAppendEntriesRPCToOneServer() call %v to %v. rand:%v\n", begintime, rf.me, serverId, flag)
 
 	//next tow line codes not lock , because if call delay too long
 	//the full rf mutex would be blocked, cause not to receive RequestVote rpc
 	reply := AppendEntriesReply{}
 	peer.Call("Raft.AppendEntries", &args, &reply)
 
-	endtime := time.Now().Unix()
-	diff := endtime - begintime
-	DPrintf("end:%v diff:%v SendAppendEntriesRPCToOneServer() modify:%v call AppendEntries %v to %v. reply Term:%v success:%v rand:%v\n", endtime, diff, reply.Modify, rf.me, serverId, reply.Term, reply.Success, flag)
+	//endtime := time.Now().Unix()
+	//diff := endtime - begintime
+	//DPrintf("end:%v diff:%v SendAppendEntriesRPCToOneServer() modify:%v call AppendEntries %v to %v. reply Term:%v success:%v rand:%v\n", endtime, diff, reply.Modify, rf.me, serverId, reply.Term, reply.Success, flag)
 
 	//rf.mu.Lock()
 	//DPrintf("call AppendEntries raft term:%v leaderid:%v serverid:%v rf.state:%q\n", args.Term, me, serverId, rf.state)
 	//DPrintf("PrevLogIndex:%v, PrevLogTerm:%v replysuccess:%v\n", args.PrevLogIndex, args.PrevLogTerm, reply.Success)
 	//rf.mu.Unlock()
 
-	retryNum := 0
+	//5.3 Log replication
 	convertFollower := false
+
+	//the NextIndex need to be atomic for goroutine
+	rf.mu.Lock()
+	nextIndexTmp := rf.leaderState.NextIndex[serverId]
+	rf.mu.Unlock()
 	for reply.Success == false {
 
 		//when reply term > currentTerm
@@ -720,44 +746,45 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 			break
 		} else {
 
-			if reply.Modify == true && rf.leaderState.NextIndex[serverId] > 1 &&
+			if reply.Modify == true && nextIndexTmp > 1 &&
 				rf.currentTerm == reply.Term && reply.Term == args.Term {
 
 				//nextindex--
-				rf.leaderState.NextIndex[serverId]--
+				nextIndexTmp--
 
-				args.PrevLogIndex = rf.leaderState.NextIndex[serverId] - 1
-				DPrintf("serverId:%v leaderCTerm:%v PrevLogIndex:%v reply.Term:%v success:%v\n",
-					serverId, rf.currentTerm, args.PrevLogIndex, reply.Term, reply.Success)
+				args.PrevLogIndex = nextIndexTmp - 1
+
 				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 
 				logs := make([]LogEntry, 1)
-				logs[0] = rf.logs[rf.leaderState.NextIndex[serverId]]
+				logs[0] = rf.logs[nextIndexTmp]
 				args.Entries = append(logs, args.Entries...)
+				DPrintf("serverId:%v leaderCTerm:%v PrevLogIndex:%v reply.Term:%v success:%v Entries len:%v\n",
+					serverId, rf.currentTerm, args.PrevLogIndex, reply.Term, reply.Success, len(args.Entries))
 
 			} else if reply.Term > args.Term {
-				retryNum = 11
-			} else {
-				retryNum++
-			}
-			rf.mu.Unlock()
-			if retryNum > 10 {
+				rf.mu.Unlock()
 				break
 			}
+			rf.mu.Unlock()
+
 			reply = AppendEntriesReply{}
 
 			//maybe blocked too
 			peer.Call("Raft.AppendEntries", &args, &reply)
+			time.Sleep(10 * time.Millisecond)
 
 		}
 	}
+
 	//this stage is follower, return
 	rf.mu.Lock()
+	rf.leaderState.NextIndex[serverId] = nextIndexTmp
 	if reply.Term > rf.currentTerm {
 		rf.mu.Unlock()
 		return
 	}
-	if retryNum <= 10 && convertFollower == false && reply.Modify == true {
+	if convertFollower == false && reply.Modify == true && reply.Success == true {
 		rf.leaderState.NextIndex[serverId] = max(rf.leaderState.NextIndex[serverId], reply.NextIndex)
 		//rf.leaderState.NextIndex[serverId] += len(args.Entries)
 		rf.leaderState.MatchIndex[serverId] = max(rf.leaderState.NextIndex[serverId]-1, 0)
