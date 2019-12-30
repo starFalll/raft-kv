@@ -67,6 +67,7 @@ type Raft struct {
 	restartTimer bool
 	state        string
 	leaderState  Leader
+	applyCh      chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -77,6 +78,12 @@ type LogEntry struct {
 type Leader struct {
 	NextIndex  []int
 	MatchIndex []int
+}
+
+//wait most server excute end
+type WaitMost struct {
+	mu     sync.Mutex
+	number int
 }
 
 //AppendEntries RPC arguments structure.
@@ -92,8 +99,10 @@ type AppendEntriesArgs struct {
 
 //AppendEntries RPC reply structure.
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	NextIndex int
+	Term      int
+	Modify    bool
+	Success   bool
 }
 
 // return currentTerm and whether this server
@@ -204,7 +213,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			reply.Ret = true
 			go rf.ConvertToCandidate(args.peers, rf.me, rf.votedFor, false)
-			DPrintf("RequestVote() term:%v serverid:%v, vote for :%v\n", reply.Term, rf.me, args.CandidateID)
+			//DPrintf("RequestVote() term:%v serverid:%v, vote for :%v\n", reply.Term, rf.me, args.CandidateID)
 			return
 		}
 	} else {
@@ -220,10 +229,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("AppendEntries leaderterm:%v, leaderid:%v, serverterm:%v, serverid:%v\n",
-		args.Term, args.LeaderID, rf.currentTerm, rf.me)
+	DPrintf("AppendEntries leaderterm:%v, leaderid:%v, serverterm:%v, serverid:%v, args.PrevLogIndex:%v, args.PrevLogTerm:%v entriesLen:%v LeaderCommit:%v\n",
+		args.Term, args.LeaderID, rf.currentTerm, rf.me, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit)
 	//implementation 1
+	reply.Modify = true
 	if args.Term < rf.currentTerm {
+
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -240,9 +251,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//now all recivers are followers
 	//implementation 2
-	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf("rf.logs[args.PrevLogIndex].Term:%v, args.PrevLogTerm:%v\n",
-			rf.logs[args.PrevLogIndex].Term, args.PrevLogTerm)
+	if args.PrevLogIndex >= len(rf.logs) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		overFlow := false
+		if args.PrevLogIndex >= len(rf.logs) {
+			overFlow = true
+		}
+		DPrintf("serverid:%v args.PrevLogIndex:%v, args.PrevLogTerm:%v overflow:%v\n",
+			rf.me, args.PrevLogIndex, args.PrevLogTerm, overFlow)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -250,6 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//not heartbeat
 	if len(args.Entries) > 0 {
+
 		for i, v := range args.Entries {
 			currentIndex := args.PrevLogIndex + i + 1
 			if currentIndex < len(rf.logs) && rf.logs[currentIndex].Term != v.Term {
@@ -259,12 +275,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.logs = append(rf.logs, v)
 			}
 		}
-		if args.LeaderCommit > rf.commitIndex {
-			indexOfLastNewEntry := args.PrevLogIndex + len(args.Entries)
-			rf.commitIndex = min(args.LeaderCommit, indexOfLastNewEntry)
-		}
+
 	}
-	DPrintf("AppendEntries heartbeat or entries\n")
+	//DPrintf("AppendEntries heartbeat or entries\n")
+	if args.LeaderCommit > rf.commitIndex {
+		beginIndex := rf.commitIndex
+		indexOfLastNewEntry := args.PrevLogIndex + len(args.Entries)
+
+		minCommit := min(args.LeaderCommit, indexOfLastNewEntry)
+		rf.commitIndex = max(rf.commitIndex, minCommit)
+		for beginIndex++; beginIndex <= rf.commitIndex; beginIndex++ {
+			DPrintf("AppendEntries serverid:%v ApplyMsg: Index:%v command:%v", rf.me, beginIndex, rf.logs[beginIndex].Command)
+			applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
+			rf.applyCh <- applyMsg
+		}
+
+	}
+	if rf.commitIndex > rf.lastApplied {
+		rf.lastApplied = rf.commitIndex
+	}
+	DPrintf("serverID:%v add Entries, length:%v, log len:%v commitIndex:%v Term:%v\n", rf.me, len(args.Entries), len(rf.logs), rf.commitIndex, rf.currentTerm)
+	DPrintf("AppendEntries serverID:%v logs:%v\n", rf.me, rf.logs)
+	reply.NextIndex = len(rf.logs)
 	reply.Term = rf.currentTerm
 	reply.Success = true
 	return
@@ -324,6 +356,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != "leader" {
+		isLeader = false
+	} else {
+		term = rf.currentTerm
+		logEntry := make([]LogEntry, 1)
+		logEntry[0] = LogEntry{term, command}
+		rf.logs = append(rf.logs, logEntry...)
+		index = len(rf.logs) - 1
+		DPrintf("Start() term:%v serverID:%v index:%v\n", term, rf.me, index)
+		DPrintf("Start serverID:%v logs:%v\n", rf.me, rf.logs)
+		go rf.SendAppendEntriesRPC(rf.peers, logEntry, index)
+	}
 
 	return index, term, isLeader
 }
@@ -373,6 +419,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//first index is 1
 	rf.logs = make([]LogEntry, 1)
 	rf.state = "follower"
+	rf.applyCh = applyCh
 
 	DPrintf("Make() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, me, rf.state)
 
@@ -387,8 +434,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) PrintRaftInfo() {
 	for {
 		rf.mu.Lock()
-		DPrintf("ServerID:%v, state:%q, term:%v, votefor:%v, votenum:%v\n",
-			rf.me, rf.state, rf.currentTerm, rf.votedFor, rf.voteNum)
+		DPrintf("ServerID:%v, state:%q, term:%v, votefor:%v, votenum:%v commitedIndex:%v log len:%v\n",
+			rf.me, rf.state, rf.currentTerm, rf.votedFor, rf.voteNum, rf.commitIndex, len(rf.logs))
 		rf.mu.Unlock()
 		time.Sleep(1000 * time.Millisecond)
 	}
@@ -480,7 +527,7 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 					reply.Ret == true && reply.VoteGranted == true {
 					rf.voteNum++
 					if rf.voteNum > len(peers)/2 {
-						go rf.BecomeLeader(peers, len(peers))
+						go rf.BecomeLeader()
 					}
 				} else if args.Term == rf.currentTerm && reply.Ret == false &&
 					reply.Term > rf.currentTerm && rf.state == "candidate" {
@@ -494,12 +541,13 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 
 }
 
-func (rf *Raft) BecomeLeader(peers []*labrpc.ClientEnd, serverNum int) {
+func (rf *Raft) BecomeLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.state = "leader"
 	rf.votedFor = -1
 	rf.voteNum = 0
+	serverNum := len(rf.peers)
 	rf.leaderState.NextIndex = make([]int, serverNum)
 	rf.leaderState.MatchIndex = make([]int, serverNum)
 	lastIndex := len(rf.logs)
@@ -509,7 +557,7 @@ func (rf *Raft) BecomeLeader(peers []*labrpc.ClientEnd, serverNum int) {
 	DPrintf("BecomeLeader() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
 	//send initial empty AppendEntries RPCs
 	//(heartbeat) to each server
-	go rf.SendHeartBeat(peers)
+	go rf.SendHeartBeat()
 }
 
 func (rf *Raft) BecomeFollower(term int) {
@@ -522,7 +570,7 @@ func (rf *Raft) BecomeFollower(term int) {
 	DPrintf("BecomeFollower() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
 }
 
-func (rf *Raft) SendHeartBeat(peers []*labrpc.ClientEnd) {
+func (rf *Raft) SendHeartBeat() {
 	//make empty entries
 	entries := make([]LogEntry, 0)
 	for {
@@ -531,9 +579,11 @@ func (rf *Raft) SendHeartBeat(peers []*labrpc.ClientEnd) {
 			rf.mu.Unlock()
 			break
 		}
-
-		go rf.SendAppendEntriesRPC(peers, entries)
-		DPrintf("SendHeartBeat() raft serverid:%v, state:%q\n", rf.me, rf.state)
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied = rf.commitIndex
+		}
+		go rf.SendAppendEntriesRPC(rf.peers, entries, rf.commitIndex)
+		//DPrintf("SendHeartBeat() raft serverid:%v, state:%q\n", rf.me, rf.state)
 		rf.mu.Unlock()
 
 		//heartbeat 100ms
@@ -542,100 +592,186 @@ func (rf *Raft) SendHeartBeat(peers []*labrpc.ClientEnd) {
 	}
 }
 
-func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEntry) {
+func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEntry, commitedIndex int) {
 	me := rf.me
-	DPrintf("SendAppendEntriesRPC() raft serverid:%v\n", rf.me)
+	DPrintf("SendAppendEntriesRPC() raft serverid:%v commiterIndex:%v\n", rf.me, commitedIndex)
+	rf.mu.Lock()
+	entriesLen := len(entries)
+	if commitedIndex < rf.commitIndex || commitedIndex == rf.commitIndex && entriesLen > 0 {
+		DPrintf("current commitIndex:%v args commitedIndex:%v entries len:%v.so old AppendEntriesRPC,skip..\n", rf.commitIndex, commitedIndex, entriesLen)
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+	waitMost := WaitMost{number: 0}
 	for serverId, peer := range peers {
 		if serverId != me {
-			go func(peer *labrpc.ClientEnd, serverId int) {
-				rf.mu.Lock()
-				if rf.state != "leader" {
-					rf.mu.Unlock()
-					return
-				}
-				args := AppendEntriesArgs{}
-				args.LeaderCommit = rf.commitIndex
-				args.LeaderID = rf.me
-				args.Term = rf.currentTerm
-				args.Entries = entries
-				args.PrevLogIndex = rf.leaderState.NextIndex[serverId] - 1
-
-				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-
-				rf.mu.Unlock()
-
-				//begintime := time.Now().Unix()
-				//flag := rand.Int31n(200000)
-				//DPrintf("begin:%v SendAppendEntriesRPC() call %v to %v. rand:%v\n", begintime, me, serverId, flag)
-
-				//next tow line codes not lock , because if call delay too long
-				//the full rf mutex would be blocked, cause not to receive RequestVote rpc
-				reply := AppendEntriesReply{-1, false}
-				peer.Call("Raft.AppendEntries", &args, &reply)
-
-				//endtime := time.Now().Unix()
-				//diff := endtime - begintime
-				//DPrintf("end:%v diff:%v SendAppendEntriesRPC() call AppendEntries %v to %v. rand:%v\n", endtime, diff, me, serverId, flag)
-
-				//rf.mu.Lock()
-				//DPrintf("call AppendEntries raft term:%v leaderid:%v serverid:%v rf.state:%q\n", args.Term, me, serverId, rf.state)
-				//DPrintf("PrevLogIndex:%v, PrevLogTerm:%v replysuccess:%v\n", args.PrevLogIndex, args.PrevLogTerm, reply.Success)
-				//rf.mu.Unlock()
-
-				retryNum := 0
-				for reply.Success == false {
-
-					//when reply term > currentTerm
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.BecomeFollower(reply.Term)
-						rf.mu.Unlock()
-						break
-					} else {
-
-						if reply.Term > -1 && rf.leaderState.NextIndex[serverId] > 1 {
-
-							//nextindex--
-							rf.leaderState.NextIndex[serverId]--
-
-							args.PrevLogIndex = rf.leaderState.NextIndex[serverId] - 1
-							DPrintf("PrevLogIndex:%v reply.Term:%v success:%v\n",
-								args.PrevLogIndex, reply.Term, reply.Success)
-							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-						} else {
-							retryNum++
-						}
-						rf.mu.Unlock()
-						if retryNum > 10 {
-							break
-						}
-						reply = AppendEntriesReply{-1, false}
-
-						//maybe blocked too
-						peer.Call("Raft.AppendEntries", &args, &reply)
-
-					}
-				}
-				//this stage is follower, return
-				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.mu.Unlock()
-					return
-				}
-				if retryNum <= 10 {
-					rf.leaderState.NextIndex[serverId] += len(entries)
-					rf.leaderState.MatchIndex[serverId] = min(rf.leaderState.NextIndex[serverId]-1, 0)
-				} else {
-					DPrintf("SendAppendEntries from :%v to :%v fail...\n", rf.me, serverId)
-				}
-
-				rf.mu.Unlock()
-			}(peer, serverId)
+			go rf.SendAppendEntriesRPCToOneServer(peer, &waitMost, serverId, entries, commitedIndex)
 		}
 	}
 	//the last rule for leader
-	//TODO
 
+	//time.Sleep(500 * time.Millisecond)
+	rf.mu.Lock()
+	if commitedIndex > rf.commitIndex && rf.state == "leader" {
+		//wait for most server excute end
+		DPrintf("commitedIndex:%v > rf.commitIndex:%v\n", commitedIndex, rf.commitIndex)
+		followerNum := len(peers)
+		rf.mu.Unlock()
+		for {
+			rf.mu.Lock()
+			waitMost.mu.Lock()
+			if waitMost.number+1 > followerNum/2 &&
+				rf.logs[commitedIndex].Term == rf.currentTerm {
+				DPrintf("waitMost.number:%v followerNum:%v\n", waitMost.number, followerNum)
+				beginIndex := rf.commitIndex
+				rf.commitIndex = commitedIndex
+				rf.leaderState.NextIndex[me] += len(entries)
+				rf.leaderState.MatchIndex[me] = min(rf.leaderState.NextIndex[me]-1, 0)
+				for beginIndex++; beginIndex <= rf.commitIndex; beginIndex++ {
+					applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
+					rf.applyCh <- applyMsg
+					DPrintf("Update LeaderID:%v commitedIndex:%v\n", rf.me, beginIndex)
+				}
+				waitMost.mu.Unlock()
+				rf.mu.Unlock()
+				break
+			}
+			waitMost.mu.Unlock()
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		/**
+		matchNum := 0
+		for _, v := range rf.leaderState.MatchIndex {
+			DPrintf("rf.leaderState.MatchIndex:%v\n", v)
+			if v >= commitedIndex {
+				matchNum++
+			}
+		}
+		**/
+
+	} else {
+		rf.mu.Unlock()
+	}
+
+}
+
+func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost *WaitMost, serverId int, entries []LogEntry, commitedIndex int) {
+	rf.mu.Lock()
+	if rf.state != "leader" {
+		rf.mu.Unlock()
+		return
+	}
+	args := AppendEntriesArgs{}
+	args.LeaderCommit = rf.commitIndex
+	args.LeaderID = rf.me
+	args.Term = rf.currentTerm
+	nextIndex := rf.leaderState.NextIndex[serverId]
+	args.PrevLogIndex = nextIndex - 1
+	DPrintf("begin args serverID:%v commitIndex:%v nextIndex:%v leadercommit:%v args.PrevLogIndex:%v loglen:%v entriesLen:%v\n",
+		serverId, commitedIndex, nextIndex, rf.commitIndex, args.PrevLogIndex, len(rf.logs), len(entries))
+	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+	if len(entries) > 0 {
+		if nextIndex > commitedIndex {
+			args.PrevLogIndex = commitedIndex - 1
+			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+			args.Entries = entries
+		} else {
+			args.Entries = rf.logs[nextIndex : commitedIndex+1]
+		}
+
+	} else {
+		args.Entries = entries
+	}
+
+	rf.mu.Unlock()
+
+	begintime := time.Now().Unix()
+	flag := rand.Int31n(10000)
+	DPrintf("begin:%v SendAppendEntriesRPCToOneServer() call %v to %v. rand:%v\n", begintime, rf.me, serverId, flag)
+
+	//next tow line codes not lock , because if call delay too long
+	//the full rf mutex would be blocked, cause not to receive RequestVote rpc
+	reply := AppendEntriesReply{}
+	peer.Call("Raft.AppendEntries", &args, &reply)
+
+	endtime := time.Now().Unix()
+	diff := endtime - begintime
+	DPrintf("end:%v diff:%v SendAppendEntriesRPCToOneServer() modify:%v call AppendEntries %v to %v. reply Term:%v success:%v rand:%v\n", endtime, diff, reply.Modify, rf.me, serverId, reply.Term, reply.Success, flag)
+
+	//rf.mu.Lock()
+	//DPrintf("call AppendEntries raft term:%v leaderid:%v serverid:%v rf.state:%q\n", args.Term, me, serverId, rf.state)
+	//DPrintf("PrevLogIndex:%v, PrevLogTerm:%v replysuccess:%v\n", args.PrevLogIndex, args.PrevLogTerm, reply.Success)
+	//rf.mu.Unlock()
+
+	retryNum := 0
+	convertFollower := false
+	for reply.Success == false {
+
+		//when reply term > currentTerm
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			DPrintf("current reply Term:%v\n", reply.Term)
+			rf.BecomeFollower(reply.Term)
+			convertFollower = true
+			rf.mu.Unlock()
+			break
+		} else {
+
+			if reply.Modify == true && rf.leaderState.NextIndex[serverId] > 1 &&
+				rf.currentTerm == reply.Term && reply.Term == args.Term {
+
+				//nextindex--
+				rf.leaderState.NextIndex[serverId]--
+
+				args.PrevLogIndex = rf.leaderState.NextIndex[serverId] - 1
+				DPrintf("serverId:%v leaderCTerm:%v PrevLogIndex:%v reply.Term:%v success:%v\n",
+					serverId, rf.currentTerm, args.PrevLogIndex, reply.Term, reply.Success)
+				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+
+				logs := make([]LogEntry, 1)
+				logs[0] = rf.logs[rf.leaderState.NextIndex[serverId]]
+				args.Entries = append(logs, args.Entries...)
+
+			} else if reply.Term > args.Term {
+				retryNum = 11
+			} else {
+				retryNum++
+			}
+			rf.mu.Unlock()
+			if retryNum > 10 {
+				break
+			}
+			reply = AppendEntriesReply{}
+
+			//maybe blocked too
+			peer.Call("Raft.AppendEntries", &args, &reply)
+
+		}
+	}
+	//this stage is follower, return
+	rf.mu.Lock()
+	if reply.Term > rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+	if retryNum <= 10 && convertFollower == false && reply.Modify == true {
+		rf.leaderState.NextIndex[serverId] = max(rf.leaderState.NextIndex[serverId], reply.NextIndex)
+		//rf.leaderState.NextIndex[serverId] += len(args.Entries)
+		rf.leaderState.MatchIndex[serverId] = max(rf.leaderState.NextIndex[serverId]-1, 0)
+		DPrintf("serverid:%v NextIndex:%v MatchIndex:%v", serverId, rf.leaderState.NextIndex[serverId], rf.leaderState.MatchIndex[serverId])
+		waitMost.mu.Lock()
+		if rf.leaderState.MatchIndex[serverId] >= commitedIndex {
+			waitMost.number++
+		}
+		waitMost.mu.Unlock()
+	} else {
+		DPrintf("SendAppendEntries from :%v to :%v fail...\n", rf.me, serverId)
+	}
+
+	rf.mu.Unlock()
 }
 
 func min(a, b int) int {
@@ -643,4 +779,10 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+func max(a, b int) int {
+	if a < b {
+		return b
+	}
+	return a
 }
