@@ -473,10 +473,10 @@ func (rf *Raft) PrintRaftInfo() {
 }
 
 func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
-	//random from 100 to 300,election timer from 1000ms to 3000ms
+	//random from 100 to 300,election timer from 500ms to 2100ms
 	//**heartbeat for 100ms,so election timer must far more than 100ms**
 	for {
-		electionTimer := rand.Int()%200 + 100
+		electionTimer := int(rand.Int63()%160 + 50)
 		i := 0
 		for ; i < electionTimer; i++ {
 			time.Sleep(10 * time.Millisecond)
@@ -720,22 +720,24 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 	args.PrevLogIndex = nextIndex - 1
 	DPrintf("begin args serverID:%v commitIndex:%v nextIndex:%v leadercommit:%v args.PrevLogIndex:%v loglen:%v entriesLen:%v\n",
 		serverId, commitedIndex, nextIndex, rf.commitIndex, args.PrevLogIndex, len(rf.logs), len(entries))
-	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+
 	if len(entries) > 0 {
 		if nextIndex > commitedIndex {
 			//in the same time ues start() twice,when bigger one end,litter one begin,case this situation
 			DPrintf("Point of doubt too: leaderid:%v serverid:%v leaderTerm:%v leaderCommit:%v commitedIndex:%v last log index:%v, nextIndex:%v\n", rf.me, serverId, rf.currentTerm, rf.commitIndex, commitedIndex, len(rf.logs)-1, nextIndex)
 			args.PrevLogIndex = commitedIndex - 1
-			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 			args.Entries = entries
 		} else {
 			args.Entries = rf.logs[nextIndex : commitedIndex+1]
 		}
 
 	} else {
+		if args.PrevLogIndex >= len(rf.logs) {
+			args.PrevLogIndex = len(rf.logs) - 1
+		}
 		args.Entries = entries
 	}
-
+	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 	rf.mu.Unlock()
 
 	//begintime := time.Now().Unix()
@@ -759,10 +761,7 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 	//5.3 Log replication
 	convertFollower := false
 
-	//the NextIndex need to be atomic for goroutine
-	rf.mu.Lock()
-	nextIndexTmp := rf.leaderState.NextIndex[serverId]
-	rf.mu.Unlock()
+	nextIndexTmp := args.PrevLogIndex + 1
 
 	for reply.Success == false {
 
