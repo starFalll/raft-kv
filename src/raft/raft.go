@@ -63,7 +63,7 @@ type Raft struct {
 	logs         []LogEntry
 	commitIndex  int
 	lastApplied  int
-	voteNum      int
+	voteMap      map[int]bool
 	restartTimer bool
 	state        string
 	leaderState  Leader
@@ -199,7 +199,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		reply.Ret = false
 		return
-	} else if rf.votedFor == -1 && rf.state == "follower" {
+	} else if rf.votedFor == -1 && rf.state == "follower" ||
+		rf.votedFor == args.CandidateID && rf.state == "follower" {
 
 		//**Note that you cannot vote repeatedly**
 
@@ -249,15 +250,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	//reset heartbeat
-	rf.restartTimer = true
 
 	rf.currentTerm = args.Term
 	if rf.state != "follower" {
 		rf.state = "follower"
 		rf.votedFor = -1
-		rf.voteNum = 0
+		rf.voteMap = make(map[int]bool)
 	}
+
+	//reset heartbeat
+	rf.restartTimer = true
 
 	//now all recivers are followers
 	//implementation 2
@@ -383,7 +385,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.logs = append(rf.logs, logEntry...)
 
 		} else {
+
+			// to avoid repeated commond
+			if len(rf.logs)-1 == rf.commitIndex {
+				index = len(rf.logs) - 1
+				DPrintf("start repeated commond,commitindex:%v\n", rf.commitIndex)
+				return index, term, isLeader
+			}
 			logEntry[0] = rf.logs[len(rf.logs)-1]
+
 		}
 		index = len(rf.logs) - 1
 
@@ -456,7 +466,7 @@ func (rf *Raft) PrintRaftInfo() {
 	for {
 		rf.mu.Lock()
 		DPrintf("ServerID:%v, state:%q, term:%v, votefor:%v, votenum:%v commitedIndex:%v log len:%v\n",
-			rf.me, rf.state, rf.currentTerm, rf.votedFor, rf.voteNum, rf.commitIndex, len(rf.logs))
+			rf.me, rf.state, rf.currentTerm, rf.votedFor, len(rf.voteMap), rf.commitIndex, len(rf.logs))
 		rf.mu.Unlock()
 		time.Sleep(1000 * time.Millisecond)
 	}
@@ -514,7 +524,8 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 
 	rf.votedFor = voteFor
 	if voteFor == me {
-		rf.voteNum = 1
+		rf.voteMap = make(map[int]bool)
+		rf.voteMap[me] = true
 	}
 
 	//restart a timer
@@ -546,8 +557,8 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 				rf.mu.Lock()
 				if args.Term == rf.currentTerm && rf.state == "candidate" &&
 					reply.Ret == true && reply.VoteGranted == true {
-					rf.voteNum++
-					if rf.voteNum > len(peers)/2 {
+					rf.voteMap[index] = true
+					if len(rf.voteMap) > len(peers)/2 {
 						go rf.BecomeLeader()
 					}
 				} else if args.Term == rf.currentTerm && reply.Ret == false &&
@@ -567,7 +578,7 @@ func (rf *Raft) BecomeLeader() {
 	defer rf.mu.Unlock()
 	rf.state = "leader"
 	rf.votedFor = -1
-	rf.voteNum = 0
+	rf.voteMap = make(map[int]bool)
 	serverNum := len(rf.peers)
 	rf.leaderState.NextIndex = make([]int, serverNum)
 	rf.leaderState.MatchIndex = make([]int, serverNum)
@@ -585,7 +596,7 @@ func (rf *Raft) BecomeFollower(term int) {
 	rf.state = "follower"
 	rf.currentTerm = term
 	rf.votedFor = -1
-	rf.voteNum = 0
+	rf.voteMap = make(map[int]bool)
 	//restart a timer
 	rf.restartTimer = true
 	DPrintf("BecomeFollower() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
@@ -627,7 +638,23 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 	waitMost := WaitMost{number: 0}
 	for serverId, peer := range peers {
 		if serverId != me {
-			go rf.SendAppendEntriesRPCToOneServer(peer, &waitMost, serverId, entries, commitedIndex)
+			rf.mu.Lock()
+
+			//the result causes next line is that before commit index,start the same commond twice
+			if entriesLen > 0 && len(rf.logs)-1 < rf.leaderState.NextIndex[serverId] ||
+				entriesLen == 0 && len(rf.logs) < rf.leaderState.NextIndex[serverId] {
+				DPrintf("Point of doubt: leaderid:%v serverid:%v leaderTerm:%v leaderCommit:%v commitedIndex:%v last log index:%v, nextIndex:%v ,entriesLen:%v\n", me, serverId, rf.currentTerm, rf.commitIndex, commitedIndex, len(rf.logs)-1, rf.leaderState.NextIndex[serverId], entriesLen)
+			}
+			if entriesLen == 0 || len(rf.logs)-1 >= rf.leaderState.NextIndex[serverId] {
+				go rf.SendAppendEntriesRPCToOneServer(peer, &waitMost, serverId, entries, commitedIndex)
+			} else if rf.leaderState.MatchIndex[serverId] >= commitedIndex {
+
+				waitMost.mu.Lock()
+				waitMost.number++
+				waitMost.mu.Unlock()
+			}
+
+			rf.mu.Unlock()
 		}
 	}
 	//the last rule for leader
@@ -648,7 +675,7 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 				beginIndex := rf.commitIndex
 				rf.commitIndex = commitedIndex
 				rf.leaderState.NextIndex[me] += len(entries)
-				rf.leaderState.MatchIndex[me] = min(rf.leaderState.NextIndex[me]-1, 0)
+				rf.leaderState.MatchIndex[me] = max(rf.leaderState.NextIndex[me]-1, 0)
 				for beginIndex++; beginIndex <= rf.commitIndex; beginIndex++ {
 					applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
 					rf.applyCh <- applyMsg
@@ -696,6 +723,8 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 	if len(entries) > 0 {
 		if nextIndex > commitedIndex {
+			//in the same time ues start() twice,when bigger one end,litter one begin,case this situation
+			DPrintf("Point of doubt too: leaderid:%v serverid:%v leaderTerm:%v leaderCommit:%v commitedIndex:%v last log index:%v, nextIndex:%v\n", rf.me, serverId, rf.currentTerm, rf.commitIndex, commitedIndex, len(rf.logs)-1, nextIndex)
 			args.PrevLogIndex = commitedIndex - 1
 			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 			args.Entries = entries
@@ -734,6 +763,7 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 	rf.mu.Lock()
 	nextIndexTmp := rf.leaderState.NextIndex[serverId]
 	rf.mu.Unlock()
+
 	for reply.Success == false {
 
 		//when reply term > currentTerm
@@ -780,6 +810,7 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 	//this stage is follower, return
 	rf.mu.Lock()
 	rf.leaderState.NextIndex[serverId] = nextIndexTmp
+
 	if reply.Term > rf.currentTerm {
 		rf.mu.Unlock()
 		return
