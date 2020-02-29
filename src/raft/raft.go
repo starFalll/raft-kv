@@ -392,6 +392,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				DPrintf("start repeated commond,commitindex:%v\n", rf.commitIndex)
 				return index, term, isLeader
 			}
+			rf.logs[len(rf.logs)-1].Term = term
 			logEntry[0] = rf.logs[len(rf.logs)-1]
 
 		}
@@ -473,7 +474,7 @@ func (rf *Raft) PrintRaftInfo() {
 }
 
 func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
-	//random from 100 to 300,election timer from 500ms to 2100ms
+	//random from 50 to 210,election timer from 500ms to 2100ms
 	//**heartbeat for 100ms,so election timer must far more than 100ms**
 	for {
 		electionTimer := int(rand.Int63()%160 + 50)
@@ -495,14 +496,18 @@ func (rf *Raft) DealRequestVote(peers []*labrpc.ClientEnd, me int) {
 		//timeout
 		rf.mu.Lock()
 		if i >= electionTimer && rf.state != "leader" {
-			addTerm := false
+			addTerm := true
 			if rf.state == "follower" {
 				DPrintf("DealRequestVote() timeout raft term:%v, serverid:%v, state:%q, ConvertToCandidate\n",
 					rf.currentTerm, me, rf.state)
 
 				//only from follower convert to candidate, increment currentTerm
-				addTerm = true
+				//addTerm = true
 			} else {
+				//paper 5.2 :When this happens, each
+				//candidate will time out and start a new election by incre-
+				//menting its term and initiating another round of Request-
+				//Vote RPCs.
 				DPrintf("Candidate:%v election timeout, start new election\n", rf.me)
 			}
 			go rf.ConvertToCandidate(peers, me, me, addTerm)
@@ -645,7 +650,7 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 				entriesLen == 0 && len(rf.logs) < rf.leaderState.NextIndex[serverId] {
 				DPrintf("Point of doubt: leaderid:%v serverid:%v leaderTerm:%v leaderCommit:%v commitedIndex:%v last log index:%v, nextIndex:%v ,entriesLen:%v\n", me, serverId, rf.currentTerm, rf.commitIndex, commitedIndex, len(rf.logs)-1, rf.leaderState.NextIndex[serverId], entriesLen)
 			}
-			if entriesLen == 0 || len(rf.logs)-1 >= rf.leaderState.NextIndex[serverId] {
+			if entriesLen == 0 || len(rf.logs)-1 >= rf.leaderState.MatchIndex[serverId] {
 				go rf.SendAppendEntriesRPCToOneServer(peer, &waitMost, serverId, entries, commitedIndex)
 			} else if rf.leaderState.MatchIndex[serverId] >= commitedIndex {
 
@@ -822,6 +827,7 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 		waitMost.mu.Lock()
 		if rf.leaderState.MatchIndex[serverId] >= commitedIndex {
 			waitMost.number++
+			DPrintf("SendAppendEntriesRPCToOneServer waitMost.number:%v\n", waitMost.number)
 		}
 		waitMost.mu.Unlock()
 	} else {
