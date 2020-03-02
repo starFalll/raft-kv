@@ -18,6 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
+	"fmt"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -130,12 +133,16 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.state)
+	e.Encode(rf.leaderState)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -147,17 +154,29 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	var commitIndex int
+	var state string
+	var leaderState Leader
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil ||
+		d.Decode(&commitIndex) != nil ||
+		d.Decode(&state) != nil ||
+		d.Decode(&leaderState) != nil {
+		fmt.Printf("ERR:func readPersist decode fail!\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+		rf.commitIndex = commitIndex
+		rf.state = state
+		rf.leaderState = leaderState
+	}
 }
 
 //
@@ -224,7 +243,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			reply.Ret = true
 			go rf.ConvertToCandidate(args.peers, rf.me, rf.votedFor, false)
+
+			//DB update
+			rf.persist()
+
 			//DPrintf("RequestVote() term:%v serverid:%v, vote for :%v\n", reply.Term, rf.me, args.CandidateID)
+			return
+		} else {
+
+			reply.Term = rf.currentTerm
+			reply.Ret = true
+			reply.VoteGranted = false
+			go rf.ConvertToCandidate(args.peers, rf.me, rf.me, false)
+
+			//DB update
+			rf.persist()
+
 			return
 		}
 	} else {
@@ -256,6 +290,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = "follower"
 		rf.votedFor = -1
 		rf.voteMap = make(map[int]bool)
+
+		//DB update
+		rf.persist()
 	}
 
 	//reset heartbeat
@@ -289,6 +326,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 
+		//DB update
+		rf.persist()
 	}
 	//DPrintf("AppendEntries heartbeat or entries\n")
 	if args.LeaderCommit > rf.commitIndex {
@@ -297,6 +336,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		minCommit := min(args.LeaderCommit, indexOfLastNewEntry)
 		rf.commitIndex = max(rf.commitIndex, minCommit)
+
+		//DB update
+		rf.persist()
+
 		for beginIndex++; beginIndex <= rf.commitIndex; beginIndex++ {
 			DPrintf("AppendEntries serverid:%v ApplyMsg: Index:%v command:%v", rf.me, beginIndex, rf.logs[beginIndex].Command)
 			applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
@@ -383,7 +426,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if lastCommond != command {
 			logEntry[0] = LogEntry{term, command}
 			rf.logs = append(rf.logs, logEntry...)
-
+			//DB update
+			rf.persist()
 		} else {
 
 			// to avoid repeated commond
@@ -393,6 +437,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				return index, term, isLeader
 			}
 			rf.logs[len(rf.logs)-1].Term = term
+			//DB update
+			rf.persist()
 			logEntry[0] = rf.logs[len(rf.logs)-1]
 
 		}
@@ -459,6 +505,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.PrintRaftInfo()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	if rf.state == "leader" {
+		go rf.SendHeartBeat()
+	}
 
 	return rf
 }
@@ -541,6 +591,9 @@ func (rf *Raft) ConvertToCandidate(peers []*labrpc.ClientEnd, me int, voteFor in
 
 	args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogIndex, lastLogTerm, peers}
 
+	//DB update
+	rf.persist()
+
 	DPrintf("ConvertToCandidate() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, me, rf.state)
 	rf.mu.Unlock()
 
@@ -591,6 +644,10 @@ func (rf *Raft) BecomeLeader() {
 	for i := 0; i < serverNum; i++ {
 		rf.leaderState.NextIndex[i] = lastIndex
 	}
+
+	//DB update
+	rf.persist()
+
 	DPrintf("BecomeLeader() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
 	//send initial empty AppendEntries RPCs
 	//(heartbeat) to each server
@@ -604,6 +661,10 @@ func (rf *Raft) BecomeFollower(term int) {
 	rf.voteMap = make(map[int]bool)
 	//restart a timer
 	rf.restartTimer = true
+
+	//DB update
+	rf.persist()
+
 	DPrintf("BecomeFollower() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, rf.me, rf.state)
 }
 
@@ -686,6 +747,10 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 					rf.applyCh <- applyMsg
 					DPrintf("Update LeaderID:%v commitedIndex:%v\n", rf.me, beginIndex)
 				}
+
+				//DB update
+				rf.persist()
+
 				waitMost.mu.Unlock()
 				rf.mu.Unlock()
 				break
@@ -823,6 +888,10 @@ func (rf *Raft) SendAppendEntriesRPCToOneServer(peer *labrpc.ClientEnd, waitMost
 		rf.leaderState.NextIndex[serverId] = max(rf.leaderState.NextIndex[serverId], reply.NextIndex)
 		//rf.leaderState.NextIndex[serverId] += len(args.Entries)
 		rf.leaderState.MatchIndex[serverId] = max(rf.leaderState.NextIndex[serverId]-1, 0)
+
+		//DB update
+		rf.persist()
+
 		DPrintf("serverid:%v NextIndex:%v MatchIndex:%v", serverId, rf.leaderState.NextIndex[serverId], rf.leaderState.MatchIndex[serverId])
 		waitMost.mu.Lock()
 		if rf.leaderState.MatchIndex[serverId] >= commitedIndex {
