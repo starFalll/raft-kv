@@ -1,12 +1,12 @@
 package kvraft
 
+import "common"
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
 )
-
-type Err string
 
 // Put or Append
 type PutAppendArgs struct {
@@ -19,7 +19,7 @@ type PutAppendArgs struct {
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err common.Err
 }
 
 type GetArgs struct {
@@ -28,6 +28,6 @@ type GetArgs struct {
 }
 
 type GetReply struct {
-	Err   Err
+	Err   common.Err
 	Value string
 }

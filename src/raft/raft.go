@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"common"
 	"fmt"
 	"labgob"
 	"labrpc"
@@ -48,6 +49,20 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Err string
+
+const (
+	KVGet    = "Get"
+	KVPut    = "Put"
+	KVAppend = "Append"
+)
+
+const (
+	OK             = "OK"
+	ErrNoKey       = "ErrNoKey"
+	ErrWrongLeader = "ErrWrongLeader"
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -71,6 +86,9 @@ type Raft struct {
 	state        string
 	leaderState  Leader
 	applyCh      chan ApplyMsg
+
+	//3A
+	kvMap map[string]string
 }
 
 type LogEntry struct {
@@ -201,6 +219,42 @@ type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
 	Ret         bool
+}
+
+func (rf *Raft) ExecCommond(commitIndex int) {
+	if v, ok := rf.logs[commitIndex].Command.(common.Op); ok {
+		//fmt.Printf("serverid:%v Op:%v\n", rf.me, v)
+		if v.Op == KVGet {
+			elem, ok := rf.kvMap[v.Key]
+			if ok == true {
+				v.Value = elem
+				v.Err = OK
+				rf.logs[commitIndex].Command = v
+				//fmt.Printf("server get key:%v value:%v\n", v.Key, v.Value)
+			} else {
+				v.Err = ErrNoKey
+				rf.logs[commitIndex].Command = v
+			}
+		} else if v.Op == KVPut {
+			rf.kvMap[v.Key] = v.Value
+			v.Err = OK
+			rf.logs[commitIndex].Command = v
+			//fmt.Printf("server put key:%v value:%v\n", v.Key, v.Value)
+		} else if v.Op == KVAppend {
+			_, ok := rf.kvMap[v.Key]
+			if ok == true {
+				rf.kvMap[v.Key] += v.Value
+				rf.logs[commitIndex].Command = v
+				//fmt.Printf("server append key:%v value:%v now value:%v\n", v.Key, v.Value, rf.kvMap[v.Key])
+			} else {
+				rf.kvMap[v.Key] = v.Value
+				v.Err = OK
+				rf.logs[commitIndex].Command = v
+				//fmt.Printf("server op:%v fail key:%v\n", v.Op, v.Key)
+			}
+		}
+		rf.lastApplied = rf.commitIndex
+	}
 }
 
 //
@@ -337,19 +391,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		minCommit := min(args.LeaderCommit, indexOfLastNewEntry)
 		rf.commitIndex = max(rf.commitIndex, minCommit)
 
-		//DB update
-		rf.persist()
+		if rf.commitIndex > rf.lastApplied {
+			begin := rf.lastApplied
+			end := rf.commitIndex
+			for i := begin + 1; i <= end; i++ {
+				rf.ExecCommond(i)
+			}
+		}
 
 		for beginIndex++; beginIndex <= rf.commitIndex; beginIndex++ {
 			DPrintf("AppendEntries serverid:%v ApplyMsg: Index:%v command:%v", rf.me, beginIndex, rf.logs[beginIndex].Command)
-			applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
-			rf.applyCh <- applyMsg
+			//applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
+			//rf.applyCh <- applyMsg
 		}
+		//DB update
+		rf.persist()
 
 	}
-	if rf.commitIndex > rf.lastApplied {
-		rf.lastApplied = rf.commitIndex
-	}
+
 	DPrintf("serverID:%v add Entries, length:%v, log len:%v commitIndex:%v Term:%v\n", rf.me, len(args.Entries), len(rf.logs), rf.commitIndex, rf.currentTerm)
 	DPrintf("AppendEntries serverID:%v logs:%v\n", rf.me, rf.logs)
 	reply.NextIndex = len(rf.logs)
@@ -420,28 +479,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	} else {
 		term = rf.currentTerm
 		logEntry := make([]LogEntry, 1)
-		lastCommond := rf.logs[len(rf.logs)-1].Command
+		//lastCommond := rf.logs[len(rf.logs)-1].Command
 
-		//if lastCommond == commond re-start, not to append, use last log entry
-		if lastCommond != command {
-			logEntry[0] = LogEntry{term, command}
-			rf.logs = append(rf.logs, logEntry...)
-			//DB update
-			rf.persist()
-		} else {
+		//if lastCommond == commond re-start, not to append, use last log entry(x)
 
-			// to avoid repeated commond
-			if len(rf.logs)-1 == rf.commitIndex {
-				index = len(rf.logs) - 1
-				DPrintf("start repeated commond,commitindex:%v\n", rf.commitIndex)
-				return index, term, isLeader
-			}
-			rf.logs[len(rf.logs)-1].Term = term
-			//DB update
-			rf.persist()
-			logEntry[0] = rf.logs[len(rf.logs)-1]
+		//commond can same,like get(0),get(0)
+		//if lastCommond != command {
+		//fmt.Printf("start() lastCommond:%v command:%v\n", lastCommond, command)
+		logEntry[0] = LogEntry{term, command}
+		rf.logs = append(rf.logs, logEntry...)
+		//DB update
+		rf.persist()
+		// } else {
+		// 	fmt.Printf("start() log len:%v commitindex:%v\n", len(rf.logs)-1, rf.commitIndex)
+		// 	// to avoid repeated commond
+		// 	if len(rf.logs)-1 == rf.commitIndex {
+		// 		index = len(rf.logs) - 1
+		// 		DPrintf("start repeated commond,commitindex:%v\n", rf.commitIndex)
+		// 		return index, term, isLeader
+		// 	}
+		// 	rf.logs[len(rf.logs)-1].Term = term
+		// 	//DB update
+		// 	rf.persist()
+		// 	logEntry[0] = rf.logs[len(rf.logs)-1]
 
-		}
+		// }
 		index = len(rf.logs) - 1
 
 		DPrintf("Start() term:%v serverID:%v index:%v\n", term, rf.me, index)
@@ -498,6 +560,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = make([]LogEntry, 1)
 	rf.state = "follower"
 	rf.applyCh = applyCh
+	rf.kvMap = make(map[string]string)
 
 	DPrintf("Make() raft term:%v serverid:%v, state:%q\n", rf.currentTerm, me, rf.state)
 
@@ -677,9 +740,7 @@ func (rf *Raft) SendHeartBeat() {
 			rf.mu.Unlock()
 			break
 		}
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied = rf.commitIndex
-		}
+		DPrintf("leaderid:%v SendHeartBeat now:%v", rf.me, time.Now().UnixNano()/1e6)
 		go rf.SendAppendEntriesRPC(rf.peers, entries, rf.commitIndex)
 		//DPrintf("SendHeartBeat() raft serverid:%v, state:%q\n", rf.me, rf.state)
 		rf.mu.Unlock()
@@ -742,10 +803,17 @@ func (rf *Raft) SendAppendEntriesRPC(peers []*labrpc.ClientEnd, entries []LogEnt
 				rf.commitIndex = commitedIndex
 				rf.leaderState.NextIndex[me] += len(entries)
 				rf.leaderState.MatchIndex[me] = max(rf.leaderState.NextIndex[me]-1, 0)
+				if rf.commitIndex > rf.lastApplied {
+					begin := rf.lastApplied
+					end := rf.commitIndex
+					for i := begin + 1; i <= end; i++ {
+						rf.ExecCommond(i)
+					}
+				}
 				for beginIndex++; beginIndex <= rf.commitIndex; beginIndex++ {
 					applyMsg := ApplyMsg{true, rf.logs[beginIndex].Command, beginIndex}
 					rf.applyCh <- applyMsg
-					DPrintf("Update LeaderID:%v commitedIndex:%v\n", rf.me, beginIndex)
+					//fmt.Printf("Update LeaderID:%v commitedIndex:%v\n", rf.me, beginIndex)
 				}
 
 				//DB update

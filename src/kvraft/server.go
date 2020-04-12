@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"common"
 	"labgob"
 	"labrpc"
 	"log"
@@ -18,13 +19,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
-
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -37,13 +31,63 @@ type KVServer struct {
 	// Your definitions here.
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	command := common.Op{"Get", args.Key, "", ""}
+	_, _, isLeader := kv.rf.Start(command)
+	if false == isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("Get is leader:%v", kv.me)
+	if m, ok := <-kv.applyCh; ok {
+		if m.CommandValid == false {
+
+		} else if v, ok := m.Command.(common.Op); ok {
+			if v.Key == args.Key {
+				reply.Err = OK
+				reply.Value = v.Value
+				DPrintf("server Get succ key:%v value:%v ret:%v", v.Key, reply.Value, reply.Err)
+				return
+			} else {
+				reply.Err = v.Err
+			}
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	command := common.Op{args.Op, args.Key, args.Value, ""}
+	_, _, isLeader := kv.rf.Start(command)
+	if false == isLeader {
+		reply.Err = ErrWrongLeader
+		// go func() {
+		// 	m, ok := <-kv.applyCh
+		// 	if ok && m.CommandValid == false {
+
+		// 	}
+		// }()
+		return
+	}
+	DPrintf("%v is leader:%v", args.Op, kv.me)
+	if m, ok := <-kv.applyCh; ok {
+		if m.CommandValid == false {
+
+		} else if v, ok := m.Command.(common.Op); ok {
+			if v.Key == args.Key {
+				reply.Err = OK
+				return
+			} else {
+				reply.Err = v.Err
+			}
+		}
+	}
+
 }
 
 //
@@ -84,7 +128,7 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(common.Op{})
 
 	kv := new(KVServer)
 	kv.me = me

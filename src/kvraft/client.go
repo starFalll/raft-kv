@@ -1,9 +1,11 @@
 package kvraft
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"time"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -39,7 +41,30 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	DPrintf("client get key:%v", key)
+	args := GetArgs{key}
+	res := ""
+	flag := false
+	for {
+		for i := range ck.servers {
+			reply := GetReply{}
+			ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+			if ok == true && reply.Err == OK {
+				res = reply.Value
+				DPrintf("Get succ. key:%v, value:%v", key, reply.Value)
+				flag = true
+				break
+			} else {
+				//DPrintf("Get fail! key:%v ret:%v", key, reply.Err)
+			}
+		}
+		if true == flag {
+			break
+		}
+		time.Sleep(1000 * time.Millisecond)
+	}
+
+	return res
 }
 
 //
@@ -54,11 +79,33 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{key, value, op}
+	flag := false
+	for {
+		for i := range ck.servers {
+			reply := PutAppendReply{}
+			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+			if ok == true && reply.Err == OK {
+				DPrintf("PutAppend succ. key:%v, value:%v, op:%v", key, value, op)
+				flag = true
+				break
+			} else {
+				//DPrintf("PutAppend fail! key:%v value:%v op:%v ret:%v", key, value, op, reply.Err)
+			}
+		}
+		if true == flag {
+			break
+		}
+		time.Sleep(1000 * time.Millisecond)
+	}
+
 }
 
 func (ck *Clerk) Put(key string, value string) {
+	DPrintf("client put key:%v value:%v", key, value)
 	ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
+	DPrintf("client Append key:%v value:%v", key, value)
 	ck.PutAppend(key, value, "Append")
 }
