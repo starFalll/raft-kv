@@ -1,6 +1,6 @@
-## 6.824: Distributed Systems
+## 基于Raft的分布式键值存储服务
 
 ### Spring 2020
 
-https://pdos.csail.mit.edu/6.824/
+
 
