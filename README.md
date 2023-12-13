@@ -1,4 +1,4 @@
-## 基于Raft的分布式键值存储服务
+## Distributed key-value storage service based on Raft
 
 ### Spring 2020
 
